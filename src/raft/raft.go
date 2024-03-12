@@ -360,6 +360,7 @@ func (rf *Raft) commit() {
 		rf.mu.Lock()
 		// 二分查找新的commitIndex
 		if rf.commitIndex < rf.snapshotIndex {
+			time.Sleep(time.Second * time.Duration(60))
 			log.Fatalln("致命错误 commitIndex < snapshotIndex", "commitIndex = ", rf.commitIndex, "snapshotIndex = ", rf.snapshotIndex)
 		}
 		left, right := rf.commitIndex+1, rf.toLogIndex(len(rf.log))-1
