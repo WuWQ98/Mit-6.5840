@@ -44,7 +44,7 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) Get(key string) (res string) {
 	// You will have to modify this function.
-	timestamp := max64(ck.maxTimestamp+1, time.Now().UnixMilli())
+	timestamp := max64(ck.maxTimestamp+100, time.Now().UnixMilli())
 	ck.maxTimestamp = timestamp
 	args := GetArgs{key, ck.ckName, timestamp}
 
@@ -82,7 +82,7 @@ func (ck *Clerk) Get(key string) (res string) {
 // arguments. and reply must be passed as a pointer.
 func (ck *Clerk) PutAppend(key string, value string, op string) {
 	// You will have to modify this function.
-	timestamp := max64(ck.maxTimestamp+1, time.Now().UnixMilli())
+	timestamp := max64(ck.maxTimestamp+100, time.Now().UnixMilli())
 	ck.maxTimestamp = timestamp
 	args := PutAppendArgs{key, value, op, ck.ckName, timestamp}
 

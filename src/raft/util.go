@@ -7,7 +7,7 @@ import (
 )
 
 // Debugging
-const Debug = false
+const Debug = true
 
 const filename = "raft.log"
 

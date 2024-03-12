@@ -20,6 +20,7 @@ package raft
 import (
 	"6.5840/labgob"
 	"bytes"
+	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -183,7 +184,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 		rf.mu.Lock()
 		sliceIdx := rf.toSliceIndex(index)
 		// DPrintf("%v ---- 节点: %d 接收server快照，index = %d, rf.snapshotIndex = %d, sliceIdx = %d, len(rf.log) = %d\n", time.Now(), rf.me, index, rf.snapshotIndex, sliceIdx, len(rf.log))
-		if index > rf.snapshotIndex && sliceIdx < len(rf.log) {
+		if sliceIdx > 0 && sliceIdx < len(rf.log) {
 			rf.snapshot = snapshot
 			rf.snapshotTerm = rf.log[sliceIdx].Term
 			rf.snapshotIndex = index
@@ -337,7 +338,7 @@ func (rf *Raft) applyLog() {
 					}(i, log)
 					select {
 					case <-ch:
-						rf.lastApplied++
+						rf.lastApplied = rf.toLogIndex(begin) + i
 					case <-time.NewTimer(time.Millisecond * time.Duration(1500)).C:
 						if rf.killed() {
 							close(rf.applyCh)
@@ -358,6 +359,9 @@ func (rf *Raft) commit() {
 	for !rf.killed() {
 		rf.mu.Lock()
 		// 二分查找新的commitIndex
+		if rf.commitIndex < rf.snapshotIndex {
+			log.Fatalln("致命错误 commitIndex < snapshotIndex", "commitIndex = ", rf.commitIndex, "snapshotIndex = ", rf.snapshotIndex)
+		}
 		left, right := rf.commitIndex+1, rf.toLogIndex(len(rf.log))-1
 		for right >= left {
 			mid := (right + left) / 2

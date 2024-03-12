@@ -73,7 +73,7 @@ func (rf *Raft) initLeader() {
 	}
 	for i := range rf.matchIndex {
 		if i != rf.me {
-			rf.matchIndex[i] = rf.commitIndex
+			rf.matchIndex[i] = 0
 		}
 	}
 

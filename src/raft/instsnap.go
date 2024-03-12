@@ -28,13 +28,11 @@ func (rf *Raft) sendSnapshot2One(idx int) {
 		defer rf.mu.Unlock()
 		if isReply.Term > rf.currentTerm {
 			rf.updateTerm(isReply.Term)
-		} else {
-			rf.matchIndex[idx] = isArgs.LastIncludeIndex
-			rf.nextIndex[idx] = rf.toLogIndex(len(rf.log))
 		}
 	}()
 }
 
+// rf.commitIndex <= args.LastIncludeIndex ，否则不会发送快照
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
@@ -60,7 +58,11 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 				rf.snapshot = args.Snapshot
 				rf.snapshotIndex = args.LastIncludeIndex
 				rf.snapshotTerm = args.LastIncludeTerm
-
+				//tmp := make([]LogInfo, 1)
+				//if i := rf.toSliceIndex(args.LastIncludeIndex); i < len(rf.log)-1 && rf.log[i].Term == args.LastIncludeTerm {
+				//	tmp = append(tmp, rf.log[i+1:]...)
+				//}
+				//rf.log = tmp
 				rf.log = make([]LogInfo, 1)
 				rf.log[0].Term = args.LastIncludeTerm
 				rf.commitIndex = args.LastIncludeIndex
