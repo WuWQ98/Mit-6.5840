@@ -349,7 +349,7 @@ func (rf *Raft) applyLog() {
 			}
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(20) * time.Millisecond)
+		time.Sleep(time.Duration(10) * time.Millisecond)
 	}
 }
 
@@ -378,7 +378,7 @@ func (rf *Raft) commit() {
 			// DPrintf("%v ---- 节点：%d commitIndex设置为 %d，触发节点为：%d\n", time.Now(), rf.me, rf.commitIndex, triggerIdx)
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(15) * time.Millisecond)
+		time.Sleep(time.Duration(5) * time.Millisecond)
 	}
 }
 
