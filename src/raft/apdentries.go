@@ -69,29 +69,15 @@ func (rf *Raft) AEResponse(idx int, args AppendEntriesArgs) {
 			return
 		}
 		if !reply.Success {
-			if !(args.PreLogIndex == rf.snapshotIndex) { // 无需发送snapshot
+			if !(args.PreLogIndex == rf.snapshotIndex && rf.snapshotIndex != 0) { // 无需发送snapshot
 				rf.retryNextIndex(idx, args, reply)
 			} else { // 需要发送snapshot
-				isArgs := &InstallSnapshotArgs{rf.currentTerm, rf.me, rf.snapshotIndex, rf.snapshotTerm, rf.snapshot}
-				isReply := &InstallSnapshotReply{}
-				go func() {
-					// DPrintf("%v ---- 节点：%d 给 %d 发送快照\n", time.Now(), rf.me, idx)
-					ok := rf.sendInstallSnapshot(idx, isArgs, isReply)
-					if !ok {
-						return
-					}
-					rf.mu.Lock()
-					defer rf.mu.Unlock()
-					if isReply.Term > rf.currentTerm {
-						rf.updateTerm(isReply.Term)
-					}
-				}()
+				rf.sendSnapshot2One(idx)
 			}
 		} else { // 匹配成功
 			DPrintf("%v ---- 节点 %d 对 节点 %d 日志匹配成功，preIndex = %d, entries = %v, matchIndex = %d\n", time.Now(), rf.me, idx, args.PreLogIndex, args.Entries, rf.matchIndex[idx])
 			rf.matchIndex[idx] = max(args.PreLogIndex+len(args.Entries), rf.matchIndex[idx]) // 在等待RPC返回期间，leader有可能添加了新日志; 落后的rpc返回的matchIndex可能比当前值小
 			rf.nextIndex[idx] = rf.toLogIndex(len(rf.log))
-			go rf.setCommitIndex(idx)
 		}
 	}
 }
@@ -119,60 +105,66 @@ func (rf *Raft) retryNextIndex(idx int, args AppendEntriesArgs, reply AppendEntr
 	rf.nextIndex[idx] = max(rf.nextIndex[idx], reply.CommitIndex+1)
 }
 
-func (rf *Raft) setCommitIndex(triggerIdx int) {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	// DPrintf("%v ---- 节点：%d 日志同步成功，开始设置leader节点 %d 的commitIndex\n", time.Now(), triggerIdx, rf.me)
-	if rf.matchIndex[triggerIdx] > rf.commitIndex {
-		// 二分查找新的commitIndex
-		left, right := rf.commitIndex+1, rf.matchIndex[triggerIdx]
-		for right >= left {
-			mid := (right + left) / 2
-			cnt := 1
-			for i := range rf.peers {
-				if i != rf.me && rf.matchIndex[i] >= mid {
-					cnt++
-				}
-			}
-			if cnt > len(rf.peers)/2 {
-				left = mid + 1
-			} else {
-				right = mid - 1
-			}
-		}
-		if rf.log[rf.toSliceIndex(right)].Term == rf.currentTerm { //只有当前任期内的entry可以通过计数提交，并将之前的entry一并提交(Figure 8)
-			rf.commitIndex = right
-			// DPrintf("%v ---- 节点：%d commitIndex设置为 %d，触发节点为：%d\n", time.Now(), rf.me, rf.commitIndex, triggerIdx)
-			go rf.applyLog()
-		}
-	}
-}
+//func (rf *Raft) setCommitIndex(triggerIdx int) {
+//	rf.mu.Lock()
+//	defer rf.mu.Unlock()
+//	// DPrintf("%v ---- 节点：%d 日志同步成功，开始设置leader节点 %d 的commitIndex\n", time.Now(), triggerIdx, rf.me)
+//	if rf.matchIndex[triggerIdx] > rf.commitIndex {
+//		// 二分查找新的commitIndex
+//		left, right := rf.commitIndex+1, rf.matchIndex[triggerIdx]
+//		for right >= left {
+//			mid := (right + left) / 2
+//			cnt := 1
+//			for i := range rf.peers {
+//				if i != rf.me && rf.matchIndex[i] >= mid {
+//					cnt++
+//				}
+//			}
+//			if cnt > len(rf.peers)/2 {
+//				left = mid + 1
+//			} else {
+//				right = mid - 1
+//			}
+//		}
+//		if rf.log[rf.toSliceIndex(right)].Term == rf.currentTerm { //只有当前任期内的entry可以通过计数提交，并将之前的entry一并提交(Figure 8)
+//			rf.commitIndex = right
+//			// DPrintf("%v ---- 节点：%d commitIndex设置为 %d，触发节点为：%d\n", time.Now(), rf.me, rf.commitIndex, triggerIdx)
+//		}
+//	}
+//}
 
-func (rf *Raft) applyLog() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
-	begin := rf.toSliceIndex(rf.lastApplied) + 1
-	end := rf.toSliceIndex(rf.commitIndex) + 1
-	for _, lg := range rf.log[begin:end] {
-		// DPrintf("%v ---- 节点 %d 应用日志索引 %d\n", time.Now(), rf.me, rf.lastApplied+1)
-		if !rf.killed() {
-			ch := make(chan bool)
-			go func(commandIndex int, command interface{}) {
-				rf.applyCh <- ApplyMsg{
-					CommandValid: true,
-					Command:      command,
-					CommandIndex: commandIndex,
-				}
-				ch <- true
-			}(rf.lastApplied+1, lg.Command)
-			select {
-			case <-ch:
-				rf.lastApplied++
-			case <-time.NewTimer(time.Second).C:
-			}
-		}
-	}
-}
+//func (rf *Raft) applyLog() {
+//	rf.mu.Lock()
+//	defer rf.mu.Unlock()
+//	fmt.Printf("%d 的 applyLog 获取锁\n", rf.me)
+//	begin := rf.toSliceIndex(rf.lastApplied) + 1
+//	end := rf.toSliceIndex(rf.commitIndex) + 1
+//	for _, lg := range rf.log[begin:end] {
+//		// DPrintf("%v ---- 节点 %d 应用日志索引 %d\n", time.Now(), rf.me, rf.lastApplied+1)
+//		if !rf.killed() {
+//			ch := make(chan bool)
+//			go func(commandIndex int, command interface{}) {
+//				defer func() {
+//					if r := recover(); r != nil {
+//						fmt.Println(r)
+//					}
+//				}()
+//				rf.applyCh <- ApplyMsg{
+//					CommandValid: true,
+//					Command:      command,
+//					CommandIndex: commandIndex,
+//				}
+//				ch <- true
+//			}(rf.lastApplied+1, lg.Command)
+//			select {
+//			case <-ch:
+//				rf.lastApplied++
+//			case <-time.NewTimer(time.Second).C:
+//			}
+//		}
+//	}
+//	fmt.Printf("%d 的 applyLog 释放锁\n", rf.me)
+//}
 
 // AE rpc响应
 func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply) {
@@ -198,7 +190,6 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 				}
 				if args.LeaderCommit > rf.commitIndex {
 					rf.commitIndex = min(args.LeaderCommit, rf.toLogIndex(len(rf.log))-1)
-					go rf.applyLog()
 				}
 			} else {
 				// 寻找最后entry的term内最早的entry索引，若未找到则取follower的snapshotIndex+1

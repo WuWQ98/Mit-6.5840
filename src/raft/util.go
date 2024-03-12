@@ -14,13 +14,14 @@ const filename = "raft.log"
 var lock sync.Mutex
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
+	if !Debug {
+		return
+	}
 	lock.Lock()
 	defer lock.Unlock()
 	file, _ := os.OpenFile(filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0777)
 	defer file.Close()
-	if Debug {
-		fmt.Fprintf(file, format, a...)
-	}
+	fmt.Fprintf(file, format, a...)
 	return
 }
 

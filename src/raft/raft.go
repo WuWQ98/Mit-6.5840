@@ -187,9 +187,7 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 			rf.snapshot = snapshot
 			rf.snapshotTerm = rf.log[sliceIdx].Term
 			rf.snapshotIndex = index
-
 			rf.trimLog(sliceIdx)
-
 			rf.log[0].Term = rf.snapshotTerm // log[0]为占位entry，方便 AE rpc 和 RV rpc 的term比较
 			rf.persist()
 		}
@@ -219,6 +217,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	isLeader := rf.loadRole() == LEADER
 
 	if isLeader {
+		DPrintf("%v ---- 节点：%d 接收日志条目 entry = %+v\n", time.Now(), rf.me, LogInfo{Term: rf.currentTerm, Command: command})
 		rf.log = append(rf.log, LogInfo{
 			Term:    rf.currentTerm,
 			Command: command,
@@ -226,7 +225,6 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		rf.persist()
 		rf.sendAppendEntriesOnce()
 	}
-
 	return index, term, isLeader
 }
 
@@ -240,10 +238,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 // confusing debug output. any goroutine with a long-running loop
 // should call killed() to check whether it should stop.
 func (rf *Raft) Kill() {
-	rf.mu.Lock()
-	defer rf.mu.Unlock()
 	DPrintf("%v ---- 节点：%d 停止\n", time.Now(), rf.me)
-	rf.persist()
 	// DPrintf("%v ---- 节点：%d 停止时快照为：%v\n", time.Now(), rf.me, rf.snapshot)
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
@@ -300,6 +295,8 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.applyCh = applyCh
 	rf.heartTime = time.Duration(110) * time.Millisecond
 	rf.log = make([]LogInfo, 1)
+	rf.nextIndex = make([]int, len(rf.peers))
+	rf.matchIndex = make([]int, len(rf.peers))
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -307,9 +304,82 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// start ticker goroutine to start elections
 	go rf.ticker()
 
+	go rf.commit()
+
+	go rf.applyLog()
+
 	go rf.printRaftInfo()
 
 	return rf
+}
+
+func (rf *Raft) applyLog() {
+	time.Sleep(time.Duration(1000) * time.Millisecond)
+	for !rf.killed() {
+		rf.mu.Lock()
+		begin := rf.toSliceIndex(rf.lastApplied) + 1
+		end := rf.toSliceIndex(rf.commitIndex) + 1
+		if begin < len(rf.log) && begin < end {
+			for i, log := range rf.log[begin:end] {
+				if !rf.killed() {
+					ch := make(chan bool)
+					go func(i int, log LogInfo) {
+						defer func() {
+							if r := recover(); r != nil {
+							}
+						}()
+						rf.applyCh <- ApplyMsg{
+							CommandValid: true,
+							Command:      log.Command,
+							CommandIndex: rf.toLogIndex(begin) + i,
+						}
+						ch <- true
+					}(i, log)
+					select {
+					case <-ch:
+						rf.lastApplied++
+					case <-time.NewTimer(time.Millisecond * time.Duration(1500)).C:
+						if rf.killed() {
+							close(rf.applyCh)
+						}
+					}
+				} else {
+					break
+				}
+			}
+		}
+		rf.mu.Unlock()
+		time.Sleep(time.Duration(20) * time.Millisecond)
+	}
+}
+
+func (rf *Raft) commit() {
+	time.Sleep(time.Duration(1000) * time.Millisecond)
+	for !rf.killed() {
+		rf.mu.Lock()
+		// 二分查找新的commitIndex
+		left, right := rf.commitIndex+1, rf.toLogIndex(len(rf.log))-1
+		for right >= left {
+			mid := (right + left) / 2
+			cnt := 1
+			for i := range rf.peers {
+				if i != rf.me && rf.matchIndex[i] >= mid {
+					cnt++
+				}
+			}
+			if cnt > len(rf.peers)/2 {
+				left = mid + 1
+			} else {
+				right = mid - 1
+			}
+		}
+		if rf.log[rf.toSliceIndex(right)].Term == rf.currentTerm { //只有当前任期内的entry可以通过计数提交，并将之前的entry一并提交(Figure 8)
+			rf.commitIndex = right
+			// DPrintf("%v ---- 节点：%d commitIndex设置为 %d，触发节点为：%d\n", time.Now(), rf.me, rf.commitIndex, triggerIdx)
+		}
+		rf.mu.Unlock()
+		time.Sleep(time.Duration(15) * time.Millisecond)
+	}
 }
 
 func (rf *Raft) loadRole() role {
@@ -349,6 +419,6 @@ func (rf *Raft) printRaftInfo() {
 		rf.mu.Lock()
 		DPrintf("%v ---- 节点: %d, 任期: %d, role: %d, commitIndex: %d, lastApplied: %d, nextIndex: %v, matchIndex: %v, snapshotIndex: %v, snapshotTerm: %v, 日志长度: %d, 日志：%+v\n", time.Now(), rf.me, rf.currentTerm, rf.loadRole(), rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex, rf.snapshotIndex, rf.snapshotTerm, len(rf.log), rf.log)
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(50) * time.Millisecond)
+		time.Sleep(time.Duration(25) * time.Millisecond)
 	}
 }

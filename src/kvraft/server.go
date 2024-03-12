@@ -4,7 +4,9 @@ import (
 	"6.5840/labgob"
 	"6.5840/labrpc"
 	"6.5840/raft"
+	"bytes"
 	"fmt"
+	"log"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -31,10 +33,10 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister    *raft.Persister
 	data         map[string]string
-	maxTimestamp map[string]int64            // 每个clerk完成的最新命令的时间戳
-	cache        map[string]map[int64]string // 暂存Get的返回数据  map[ckName]map[timestamp]result
-	doneCh       map[string]chan string      // applyMsg应用完成通道
+	maxTimestamp map[string]int64       // 每个clerk完成的最新命令的时间戳
+	doneCh       map[string]chan string // applyMsg应用完成通道
 }
 
 func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
@@ -43,12 +45,11 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 	op := Op{OpType: "Get", Key: args.Key, CkName: args.CkName, Timestamp: args.Timestamp}
 
 	kv.mu.Lock()
-	kv.clearCache(args.CkName, args.Timestamp)
 	maxTimestamp := kv.maxTimestamp[args.CkName]
 	kv.mu.Unlock()
 
 	if args.Timestamp > maxTimestamp {
-		_, _, isLeader := kv.rf.Start(op) // kv.rf.Start(op)是并发安全的
+		_, _, isLeader := kv.rf.Start(op)
 		reply.Retry = !isLeader
 		if isLeader {
 			chName := fmt.Sprintf("%s-%d", args.CkName, args.Timestamp)
@@ -64,17 +65,20 @@ func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
 				reply.Retry = true
 			}
 			kv.mu.Lock()
-			close(kv.doneCh[chName])
-			delete(kv.doneCh, chName)
+			if _, exist := kv.doneCh[chName]; exist {
+				close(kv.doneCh[chName])
+				delete(kv.doneCh, chName)
+			}
 			kv.mu.Unlock()
 		} else {
-			reply.Err = Err(fmt.Sprintf("err = %s, current = %d, leader = %d", ErrWrongLeader, kv.me, kv.rf.GetLeader()))
+			reply.Err = ErrWrongLeader
 		}
 	} else { // 带着结果的rpc返回失败后，重试的rpc进入这里
-		kv.mu.Lock()
-		if _, exist := kv.cache[args.CkName][args.Timestamp]; exist {
-			reply.Value = kv.cache[args.CkName][args.Timestamp]
+		if args.Timestamp < maxTimestamp {
+			log.Println("警告，出现意外程序行为")
 		}
+		kv.mu.Lock()
+		reply.Value = kv.data[args.Key]
 		kv.mu.Unlock()
 	}
 }
@@ -85,7 +89,6 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 	op := Op{args.Op, args.Key, args.Value, args.CkName, args.Timestamp}
 
 	kv.mu.Lock()
-	kv.clearCache(args.CkName, args.Timestamp)
 	maxTimestamp := kv.maxTimestamp[args.CkName]
 	kv.mu.Unlock()
 
@@ -105,11 +108,17 @@ func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
 				reply.Retry = true
 			}
 			kv.mu.Lock()
-			close(kv.doneCh[chName])
-			delete(kv.doneCh, chName)
+			if _, exist := kv.doneCh[chName]; exist {
+				close(kv.doneCh[chName])
+				delete(kv.doneCh, chName)
+			}
 			kv.mu.Unlock()
 		} else {
-			reply.Err = Err(fmt.Sprintf("err = %s, current = %d, leader = %d", ErrWrongLeader, kv.me, kv.rf.GetLeader()))
+			reply.Err = ErrWrongLeader
+		}
+	} else {
+		if args.Timestamp < maxTimestamp {
+			log.Println("警告，出现意外程序行为")
 		}
 	}
 }
@@ -157,16 +166,13 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// You may need initialization code here.
 	kv.data = make(map[string]string)
 	kv.maxTimestamp = make(map[string]int64)
-	kv.cache = make(map[string]map[int64]string)
 	kv.doneCh = make(map[string]chan string)
 
+	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
-	// You may need initialization code here.
-	//if err := json.Unmarshal(persister.ReadSnapshot(), &kv.data); err != nil {
-	//	log.Fatalf("读取快照失败，错误原因：%s\n", err.Error())
-	//}
+	kv.decSnapshot(kv.persister.ReadSnapshot())
 
 	go kv.apply()
 
@@ -175,38 +181,35 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 func (kv *KVServer) apply() {
 	for !kv.killed() {
-		msg := <-kv.applyCh
-		if msg.SnapshotValid {
-			//if err := json.Unmarshal(msg.Snapshot, &kv.data); err != nil {
-			//	log.Fatalf("读取快照失败，错误原因：%s\n", err.Error())
-			//} else {
-			//	kv.mu.Lock()
-			//	kv.doneIndex = max(kv.doneIndex, msg.SnapshotIndex)
-			//	kv.mu.Unlock()
-			//}
-		} else if msg.CommandValid {
-			kv.doCommand(msg.Command.(Op))
-			//if kv.maxraftstate != -1 && msg.CommandIndex%kv.maxraftstate == 0 {
-			//	snapshot, err := json.Marshal(kv.data)
-			//	if err != nil {
-			//		log.Fatalf("序列化数据失败，失败原因：%s\n", err.Error())
-			//	} else {
-			//		go kv.rf.Snapshot(msg.CommandIndex, snapshot)
-			//	}
-			//}
+		select {
+		case msg := <-kv.applyCh:
+			kv.mu.Lock()
+			if msg.SnapshotValid {
+				if msg.Snapshot != nil && len(msg.Snapshot) >= 1 {
+					kv.decSnapshot(msg.Snapshot)
+				}
+			} else if msg.CommandValid {
+				kv.doCommand(msg.Command.(Op))
+				if size := kv.persister.RaftStateSize(); kv.maxraftstate != -1 && size > kv.maxraftstate/2 {
+					w := new(bytes.Buffer)
+					e := labgob.NewEncoder(w)
+					e.Encode(kv.data)
+					e.Encode(kv.maxTimestamp)
+					snapshot := w.Bytes()
+					kv.rf.Snapshot(msg.CommandIndex, snapshot)
+				}
+			}
+			kv.mu.Unlock()
+		case <-time.NewTimer(time.Second).C:
 		}
 	}
 }
 
 func (kv *KVServer) doCommand(cmd Op) {
-	kv.mu.Lock()
-	defer kv.mu.Unlock()
 	chName := fmt.Sprintf("%s-%d", cmd.CkName, cmd.Timestamp)
 	switch cmd.OpType {
 	case "Get":
 		if cmd.Timestamp > kv.maxTimestamp[cmd.CkName] {
-			kv.clearCache(cmd.CkName, cmd.Timestamp)
-			kv.cache[cmd.CkName][cmd.Timestamp] = kv.data[cmd.Key]
 			kv.maxTimestamp[cmd.CkName] = cmd.Timestamp
 			if ch, exist := kv.doneCh[chName]; exist {
 				ch <- kv.data[cmd.Key]
@@ -232,23 +235,15 @@ func (kv *KVServer) doCommand(cmd Op) {
 
 }
 
-// 清除已完成的Get请求的结果缓存
-func (kv *KVServer) clearCache(ckName string, maxTimestamp int64) {
-	_, exist := kv.cache[ckName]
-	if !exist {
-		kv.cache[ckName] = make(map[int64]string)
+func (kv *KVServer) decSnapshot(snapshot []byte) {
+	r := bytes.NewBuffer(snapshot)
+	d := labgob.NewDecoder(r)
+	var data map[string]string
+	var maxTimestamp map[string]int64
+	if d.Decode(&data) != nil || d.Decode(&maxTimestamp) != nil {
+		DPrintf("%v ---- server：%d 反序列化快照失败\n", time.Now(), kv.me)
+	} else {
+		kv.data = data
+		kv.maxTimestamp = maxTimestamp
 	}
-	go func() {
-		kv.mu.Lock()
-		defer kv.mu.Unlock()
-		toDel := make([]int64, 0, len(kv.cache[ckName]))
-		for k := range kv.cache[ckName] {
-			if k < maxTimestamp {
-				toDel = append(toDel, k)
-			}
-		}
-		for _, k := range toDel {
-			delete(kv.cache[ckName], k)
-		}
-	}()
 }

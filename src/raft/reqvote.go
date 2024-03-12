@@ -66,14 +66,16 @@ func (rf *Raft) beLeader() {
 
 // 需要在同步代码块中执行
 func (rf *Raft) initLeader() {
-	rf.nextIndex = make([]int, len(rf.peers))
 	for i := range rf.nextIndex {
 		if i != rf.me {
 			rf.nextIndex[i] = rf.toLogIndex(len(rf.log))
 		}
 	}
-
-	rf.matchIndex = make([]int, len(rf.peers))
+	for i := range rf.matchIndex {
+		if i != rf.me {
+			rf.matchIndex[i] = rf.commitIndex
+		}
+	}
 
 	rf.leaderId = rf.me
 }
@@ -113,7 +115,6 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	}
 	reply.Term = rf.currentTerm
 	rf.persist() // 持久化数据
-
 	// DPrintf("%v ---- 节点：%d 持久化数据：term = %d，voteFor = %v，log = %v\n (RV)", time.Now(), rf.me, rf.currentTerm, rf.votedFor, rf.log)
 }
 
