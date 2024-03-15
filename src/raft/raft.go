@@ -225,7 +225,9 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) Kill() {
 	DPrintf("%v ---- 节点：%d 停止\n", time.Now(), rf.me)
 	// DPrintf("%v ---- 节点：%d 停止时快照为：%v\n", time.Now(), rf.me, rf.snapshot)
+	rf.mu.Lock()
 	atomic.StoreInt32(&rf.dead, 1)
+	rf.mu.Unlock()
 	// Your code here, if desired.
 	rf.commitCond.Broadcast()
 	rf.applyCond.Broadcast()
@@ -307,24 +309,26 @@ func Make(peers []*labrpc.ClientEnd, me int,
 func (rf *Raft) applyLog() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		for rf.lastApplied >= rf.commitIndex && !rf.killed() {
-			rf.applyCond.Wait()
-		}
-		begin := rf.toSliceIndex(rf.lastApplied) + 1
-		end := rf.toSliceIndex(rf.commitIndex) + 1
-		entries := make([]Entry, end-begin)
-		copy(entries, rf.log[begin:end])
-		rf.mu.Unlock()
-
-		for _, entry := range entries {
-			rf.applyCh <- ApplyMsg{
-				CommandValid: true,
-				Command:      entry.Command,
-				CommandIndex: entry.Index,
+		if !rf.killed() {
+			for rf.lastApplied >= rf.commitIndex && !rf.killed() {
+				rf.applyCond.Wait()
 			}
-			rf.mu.Lock()
-			rf.lastApplied = Max(rf.lastApplied, entry.Index) //安装快照会改变rf.lastApplied
+			begin := rf.toSliceIndex(rf.lastApplied) + 1
+			end := rf.toSliceIndex(rf.commitIndex) + 1
+			entries := make([]Entry, end-begin)
+			copy(entries, rf.log[begin:end])
 			rf.mu.Unlock()
+
+			for _, entry := range entries {
+				rf.applyCh <- ApplyMsg{
+					CommandValid: true,
+					Command:      entry.Command,
+					CommandIndex: entry.Index,
+				}
+				rf.mu.Lock()
+				rf.lastApplied = Max(rf.lastApplied, entry.Index) //安装快照会改变rf.lastApplied
+				rf.mu.Unlock()
+			}
 		}
 	}
 	rf.wg.Done()
@@ -333,27 +337,29 @@ func (rf *Raft) applyLog() {
 func (rf *Raft) commit() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		rf.commitCond.Wait()
-		// 二分查找新的commitIndex
-		left, right := rf.commitIndex+1, rf.toLogIndex(len(rf.log))-1
-		for right >= left {
-			mid := (right + left) / 2
-			cnt := 1
-			for i := range rf.peers {
-				if i != rf.me && rf.matchIndex[i] >= mid {
-					cnt++
+		if !rf.killed() {
+			rf.commitCond.Wait()
+			// 二分查找新的commitIndex
+			left, right := rf.commitIndex+1, rf.toLogIndex(len(rf.log))-1
+			for right >= left {
+				mid := (right + left) / 2
+				cnt := 1
+				for i := range rf.peers {
+					if i != rf.me && rf.matchIndex[i] >= mid {
+						cnt++
+					}
+				}
+				if cnt > len(rf.peers)/2 {
+					left = mid + 1
+				} else {
+					right = mid - 1
 				}
 			}
-			if cnt > len(rf.peers)/2 {
-				left = mid + 1
-			} else {
-				right = mid - 1
+			if rf.log[rf.toSliceIndex(right)].Term == rf.currentTerm && rf.loadState() == LEADER { //只有当前任期内的entry可以通过计数提交，并将之前的entry一并提交(Figure 8)
+				rf.commitIndex = right
+				rf.applyCond.Broadcast()
+				// DPrintf("%v ---- 节点：%d commitIndex设置为 %d\n", time.Now(), rf.me, rf.commitIndex)
 			}
-		}
-		if rf.log[rf.toSliceIndex(right)].Term == rf.currentTerm && rf.loadState() == LEADER { //只有当前任期内的entry可以通过计数提交，并将之前的entry一并提交(Figure 8)
-			rf.commitIndex = right
-			rf.applyCond.Broadcast()
-			// DPrintf("%v ---- 节点：%d commitIndex设置为 %d\n", time.Now(), rf.me, rf.commitIndex)
 		}
 		rf.mu.Unlock()
 	}

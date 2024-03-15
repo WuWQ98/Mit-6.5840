@@ -91,7 +91,9 @@ func (sc *ShardCtrler) Command(args *CommandArgs, reply *CommandReply) {
 
 func (sc *ShardCtrler) Kill() {
 	sc.rf.Kill()
+	sc.mu.Lock()
 	atomic.StoreInt32(&sc.dead, 1)
+	sc.mu.Unlock()
 	sc.snapshotCond.Broadcast()
 }
 
@@ -266,17 +268,19 @@ func (sc *ShardCtrler) decSnapshot(snapshot []byte) {
 func (sc *ShardCtrler) makeSnapshot() {
 	for !sc.killed() {
 		sc.mu.Lock()
-		for sc.persister.RaftStateSize() < (sc.maxraftstate/4) && !sc.killed() {
-			sc.snapshotCond.Wait()
-		}
 		if !sc.killed() {
-			w := new(bytes.Buffer)
-			e := labgob.NewEncoder(w)
-			e.Encode(sc.configs)
-			e.Encode(sc.lastSeqId)
-			e.Encode(sc.lastApplied)
-			snapshot := w.Bytes()
-			sc.rf.Snapshot(sc.lastApplied, snapshot)
+			for sc.persister.RaftStateSize() < (sc.maxraftstate/4) && !sc.killed() {
+				sc.snapshotCond.Wait()
+			}
+			if !sc.killed() {
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(sc.configs)
+				e.Encode(sc.lastSeqId)
+				e.Encode(sc.lastApplied)
+				snapshot := w.Bytes()
+				sc.rf.Snapshot(sc.lastApplied, snapshot)
+			}
 		}
 		sc.mu.Unlock()
 	}

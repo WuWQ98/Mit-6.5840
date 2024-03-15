@@ -2,7 +2,7 @@ package kvraft
 
 import (
 	"6.5840/labrpc"
-	"strconv"
+	"fmt"
 	"time"
 )
 import "crypto/rand"
@@ -26,7 +26,8 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
 
-	ck.ckId = strconv.FormatInt(nrand(), 10)
+	time.Sleep(time.Millisecond)
+	ck.ckId = fmt.Sprintf("ck-%d-%d", time.Now().UnixMilli(), nrand())
 	DPrintf("--------------------->启动clerk<---------------------\n")
 	return ck
 }

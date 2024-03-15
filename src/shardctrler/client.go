@@ -6,7 +6,7 @@ package shardctrler
 
 import (
 	"6.5840/labrpc"
-	"strconv"
+	"fmt"
 )
 import "time"
 import "crypto/rand"
@@ -28,8 +28,9 @@ func nrand() int64 {
 func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 	ck := new(Clerk)
 	ck.servers = servers
-
-	ck.ckId = strconv.FormatInt(nrand(), 10)
+	
+	time.Sleep(time.Millisecond)
+	ck.ckId = fmt.Sprintf("ck-%d-%d", time.Now().UnixMilli(), nrand())
 	return ck
 }
 

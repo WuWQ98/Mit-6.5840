@@ -84,7 +84,9 @@ func (kv *KVServer) Command(args *CommandArgs, reply *CommandReply) {
 
 func (kv *KVServer) Kill() {
 	kv.rf.Kill() // 先回收raft的资源，再停止从applyCh接收entry
+	kv.mu.Lock()
 	atomic.StoreInt32(&kv.dead, 1)
+	kv.mu.Unlock()
 	kv.snapshotCond.Broadcast()
 }
 
@@ -189,17 +191,19 @@ func (kv *KVServer) decSnapshot(snapshot []byte) {
 func (kv *KVServer) makeSnapshot() {
 	for !kv.killed() {
 		kv.mu.Lock()
-		for kv.persister.RaftStateSize() < (kv.maxraftstate/4) && !kv.killed() {
-			kv.snapshotCond.Wait()
-		}
 		if !kv.killed() {
-			w := new(bytes.Buffer)
-			e := labgob.NewEncoder(w)
-			e.Encode(kv.db)
-			e.Encode(kv.lastSeqId)
-			e.Encode(kv.lastApplied)
-			snapshot := w.Bytes()
-			kv.rf.Snapshot(kv.lastApplied, snapshot)
+			for kv.persister.RaftStateSize() < (kv.maxraftstate/4) && !kv.killed() {
+				kv.snapshotCond.Wait()
+			}
+			if !kv.killed() {
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(kv.db)
+				e.Encode(kv.lastSeqId)
+				e.Encode(kv.lastApplied)
+				snapshot := w.Bytes()
+				kv.rf.Snapshot(kv.lastApplied, snapshot)
+			}
 		}
 		kv.mu.Unlock()
 	}
