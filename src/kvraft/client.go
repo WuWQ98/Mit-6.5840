@@ -35,24 +35,24 @@ func MakeClerk(servers []*labrpc.ClientEnd) *Clerk {
 func (ck *Clerk) Put(key string, value string) {
 	seqId := time.Now().UnixMilli()
 	args := CommandArgs{key, value, "Put", ck.ckId, seqId}
-	ck.command(args, CommandReply{})
+	ck.command(args)
 }
 func (ck *Clerk) Append(key string, value string) {
 	seqId := time.Now().UnixMilli()
 	args := CommandArgs{key, value, "Append", ck.ckId, seqId}
-	ck.command(args, CommandReply{})
+	ck.command(args)
 }
 
 func (ck *Clerk) Get(key string) (res string) {
 	seqId := time.Now().UnixMilli()
 	args := CommandArgs{Key: key, Op: "Get", CkId: ck.ckId, SeqId: seqId}
-	return ck.command(args, CommandReply{})
+	return ck.command(args)
 }
 
-func (ck *Clerk) command(args CommandArgs, reply CommandReply) string {
+func (ck *Clerk) command(args CommandArgs) string {
 	defer time.Sleep(time.Duration(1) * time.Millisecond)
 	for {
-		r := reply
+		var r CommandReply
 		ok := ck.servers[ck.leaderId].Call("KVServer.Command", &args, &r)
 		if ok && r.Err == OK {
 			return r.Value
