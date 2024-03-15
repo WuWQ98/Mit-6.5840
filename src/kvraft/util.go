@@ -4,14 +4,19 @@ import (
 	"fmt"
 	"os"
 	"sync"
+	"time"
 )
 
 // Debugging
 const Debug = false
 
-const filename = "kvraft.log"
+var filename string
 
 var lock sync.Mutex
+
+func init() {
+	filename = fmt.Sprintf("kvraft_%s.log", time.Now().Format("2006-01-02_15:04:05"))
+}
 
 func DPrintf(format string, a ...interface{}) (n int, err error) {
 	if !Debug {
@@ -23,25 +28,4 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	defer file.Close()
 	fmt.Fprintf(file, format, a...)
 	return
-}
-
-func max(a, b int) int {
-	if a > b {
-		return a
-	}
-	return b
-}
-
-func min(a, b int) int {
-	if a < b {
-		return a
-	}
-	return b
-}
-
-func max64(a, b int64) int64 {
-	if a > b {
-		return a
-	}
-	return b
 }

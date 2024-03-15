@@ -1,11 +1,30 @@
 package raft
 
+type State int32
+
+const (
+	FOLLOWER State = iota
+	CANDIDATE
+	LEADER
+)
+
+type Entry struct {
+	Term    int
+	Index   int
+	Command interface{}
+}
+
+type VoteFor struct {
+	Term        int
+	CandidateId int
+}
+
 type AppendEntriesArgs struct {
 	Term         int
 	LeaderId     int
 	PreLogIndex  int
 	PreLogTerm   int
-	Entries      []LogInfo
+	Entries      []Entry
 	LeaderCommit int
 }
 

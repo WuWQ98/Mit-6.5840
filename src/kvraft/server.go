@@ -13,14 +13,7 @@ import (
 )
 
 type Op struct {
-	// Your definitions here.
-	// Field names must start with capital letters,
-	// otherwise RPC will break.
-	OpType    string
-	Key       string
-	Value     string
-	CkName    string
-	Timestamp int64
+	CommandArgs
 }
 
 type KVServer struct {
@@ -32,109 +25,67 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	// Your definitions here.
 	persister    *raft.Persister
-	data         map[string]string
-	maxTimestamp map[string]int64       // 每个clerk完成的最新命令的时间戳
-	doneCh       map[string]chan string // applyMsg应用完成通道
+	db           map[string]string
+	lastSeqId    map[string]int64
+	session      map[string]chan struct{}
+	snapshotCond *sync.Cond
+	lastApplied  int
 }
 
-func (kv *KVServer) Get(args *GetArgs, reply *GetReply) {
-	// Your code here.
-	DPrintf("%v ---- %d 接收 Get 请求，args = %+v\n", time.Now(), kv.me, args)
-	op := Op{OpType: "Get", Key: args.Key, CkName: args.CkName, Timestamp: args.Timestamp}
+func (kv *KVServer) Command(args *CommandArgs, reply *CommandReply) {
+	op := Op{*args}
 
 	kv.mu.Lock()
-	maxTimestamp := kv.maxTimestamp[args.CkName]
+	id := kv.lastSeqId[args.CkId]
 	kv.mu.Unlock()
 
-	if args.Timestamp > maxTimestamp {
+	if args.SeqId > id {
 		_, _, isLeader := kv.rf.Start(op)
-		reply.Retry = !isLeader
+		kv.snapshotCond.Broadcast()
 		if isLeader {
-			chName := fmt.Sprintf("%s-%d", args.CkName, args.Timestamp)
+			sessionName := fmt.Sprintf("%s-%d", args.CkId, args.SeqId)
+
 			kv.mu.Lock()
-			kv.doneCh[chName] = make(chan string)
-			ch := kv.doneCh[chName]
+			kv.session[sessionName] = make(chan struct{})
+			ch := kv.session[sessionName]
 			kv.mu.Unlock()
+
+			timer := time.NewTimer(time.Second)
 			select {
-			case value := <-ch:
-				reply.Value = value
-			case <-time.NewTimer(time.Second).C:
+			case <-ch:
+				timer.Stop()
+				reply.Err = OK
+			case <-timer.C:
 				reply.Err = ErrTimeout
-				reply.Retry = true
 			}
+
 			kv.mu.Lock()
-			if _, exist := kv.doneCh[chName]; exist {
-				close(kv.doneCh[chName])
-				delete(kv.doneCh, chName)
+			reply.Value = kv.db[args.Key]
+			if _, exist := kv.session[sessionName]; exist {
+				close(kv.session[sessionName])
+				delete(kv.session, sessionName)
 			}
 			kv.mu.Unlock()
+
 		} else {
 			reply.Err = ErrWrongLeader
 		}
 	} else { // 带着结果的rpc返回失败后，重试的rpc进入这里
-		if args.Timestamp < maxTimestamp {
-			log.Println("警告，出现意外程序行为")
+		if args.SeqId < id {
+			log.Println("警告! [", args.Op, "] 出现意外程序行为", "[args] = ", args, "[lastSeqId] = ", id)
 		}
 		kv.mu.Lock()
-		reply.Value = kv.data[args.Key]
+		reply.Value = kv.db[args.Key]
 		kv.mu.Unlock()
+		reply.Err = OK
 	}
 }
 
-func (kv *KVServer) PutAppend(args *PutAppendArgs, reply *PutAppendReply) {
-	// Your code here.
-	DPrintf("%v ---- %d 接收 %s 请求，args = %+v\n", time.Now(), kv.me, args.Op, args)
-	op := Op{args.Op, args.Key, args.Value, args.CkName, args.Timestamp}
-
-	kv.mu.Lock()
-	maxTimestamp := kv.maxTimestamp[args.CkName]
-	kv.mu.Unlock()
-
-	if args.Timestamp > maxTimestamp {
-		_, _, isLeader := kv.rf.Start(op)
-		reply.Retry = !isLeader
-		if isLeader {
-			chName := fmt.Sprintf("%s-%d", args.CkName, args.Timestamp)
-			kv.mu.Lock()
-			kv.doneCh[chName] = make(chan string)
-			ch := kv.doneCh[chName]
-			kv.mu.Unlock()
-			select {
-			case <-ch:
-			case <-time.NewTimer(time.Second).C:
-				reply.Err = ErrTimeout
-				reply.Retry = true
-			}
-			kv.mu.Lock()
-			if _, exist := kv.doneCh[chName]; exist {
-				close(kv.doneCh[chName])
-				delete(kv.doneCh, chName)
-			}
-			kv.mu.Unlock()
-		} else {
-			reply.Err = ErrWrongLeader
-		}
-	} else {
-		if args.Timestamp < maxTimestamp {
-			log.Println("警告，出现意外程序行为")
-		}
-	}
-}
-
-// the tester calls Kill() when a KVServer instance won't
-// be needed again. for your convenience, we supply
-// code to set rf.dead (without needing a lock),
-// and a killed() method to test rf.dead in
-// long-running loops. you can also add your own
-// code to Kill(). you're not required to do anything
-// about this, but it may be convenient (for example)
-// to suppress debug output from a Kill()ed instance.
 func (kv *KVServer) Kill() {
+	kv.rf.Kill() // 先回收raft的资源，再停止从applyCh接收entry
 	atomic.StoreInt32(&kv.dead, 1)
-	kv.rf.Kill()
-	// Your code here, if desired.
+	kv.snapshotCond.Broadcast()
 }
 
 func (kv *KVServer) killed() bool {
@@ -142,31 +93,17 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
-// servers[] contains the ports of the set of
-// servers that will cooperate via Raft to
-// form the fault-tolerant key/value service.
-// me is the index of the current server in servers[].
-// the k/v server should store snapshots through the underlying Raft
-// implementation, which should call persister.SaveStateAndSnapshot() to
-// atomically save the Raft state along with the snapshot.
-// the k/v server should snapshot when Raft's saved state exceeds maxraftstate bytes,
-// in order to allow Raft to garbage-collect its log. if maxraftstate is -1,
-// you don't need to snapshot.
-// StartKVServer() must return quickly, so it should start goroutines
-// for any long-running work.
 func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister, maxraftstate int) *KVServer {
-	// call labgob.Register on structures you want
-	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
-	// You may need initialization code here.
-	kv.data = make(map[string]string)
-	kv.maxTimestamp = make(map[string]int64)
-	kv.doneCh = make(map[string]chan string)
+	kv.db = make(map[string]string)
+	kv.lastSeqId = make(map[string]int64)
+	kv.session = make(map[string]chan struct{})
+	kv.snapshotCond = sync.NewCond(&kv.mu)
 
 	kv.persister = persister
 	kv.applyCh = make(chan raft.ApplyMsg)
@@ -176,11 +113,16 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 
 	go kv.apply()
 
+	if kv.maxraftstate >= 0 {
+		go kv.makeSnapshot()
+	}
+
 	return kv
 }
 
 func (kv *KVServer) apply() {
 	for !kv.killed() {
+		timer := time.NewTimer(time.Second)
 		select {
 		case msg := <-kv.applyCh:
 			kv.mu.Lock()
@@ -190,60 +132,75 @@ func (kv *KVServer) apply() {
 				}
 			} else if msg.CommandValid {
 				kv.doCommand(msg.Command.(Op))
-				if size := kv.persister.RaftStateSize(); kv.maxraftstate != -1 && size > kv.maxraftstate/2 {
-					w := new(bytes.Buffer)
-					e := labgob.NewEncoder(w)
-					e.Encode(kv.data)
-					e.Encode(kv.maxTimestamp)
-					snapshot := w.Bytes()
-					kv.rf.Snapshot(msg.CommandIndex, snapshot)
-				}
+				kv.lastApplied = msg.CommandIndex
+				kv.snapshotCond.Broadcast()
 			}
 			kv.mu.Unlock()
-		case <-time.NewTimer(time.Second).C:
+			timer.Stop()
+		case <-timer.C:
 		}
 	}
 }
 
 func (kv *KVServer) doCommand(cmd Op) {
-	chName := fmt.Sprintf("%s-%d", cmd.CkName, cmd.Timestamp)
-	switch cmd.OpType {
+	sessionName := fmt.Sprintf("%s-%d", cmd.CkId, cmd.SeqId)
+	switch cmd.Op {
 	case "Get":
-		if cmd.Timestamp > kv.maxTimestamp[cmd.CkName] {
-			kv.maxTimestamp[cmd.CkName] = cmd.Timestamp
-			if ch, exist := kv.doneCh[chName]; exist {
-				ch <- kv.data[cmd.Key]
+		if cmd.SeqId > kv.lastSeqId[cmd.CkId] {
+			kv.lastSeqId[cmd.CkId] = cmd.SeqId
+			if ch, exist := kv.session[sessionName]; exist {
+				ch <- struct{}{}
 			}
 		}
 	case "Put":
-		if cmd.Timestamp > kv.maxTimestamp[cmd.CkName] {
-			kv.data[cmd.Key] = cmd.Value
-			kv.maxTimestamp[cmd.CkName] = cmd.Timestamp
-			if ch, exist := kv.doneCh[chName]; exist {
-				ch <- kv.data[cmd.Key]
+		if cmd.SeqId > kv.lastSeqId[cmd.CkId] {
+			kv.db[cmd.Key] = cmd.Value
+			kv.lastSeqId[cmd.CkId] = cmd.SeqId
+			if ch, exist := kv.session[sessionName]; exist {
+				ch <- struct{}{}
 			}
 		}
 	case "Append":
-		if cmd.Timestamp > kv.maxTimestamp[cmd.CkName] {
-			kv.data[cmd.Key] += cmd.Value
-			kv.maxTimestamp[cmd.CkName] = cmd.Timestamp
-			if ch, exist := kv.doneCh[chName]; exist {
-				ch <- kv.data[cmd.Key]
+		if cmd.SeqId > kv.lastSeqId[cmd.CkId] {
+			kv.db[cmd.Key] += cmd.Value
+			kv.lastSeqId[cmd.CkId] = cmd.SeqId
+			if ch, exist := kv.session[sessionName]; exist {
+				ch <- struct{}{}
 			}
 		}
 	}
-
 }
 
 func (kv *KVServer) decSnapshot(snapshot []byte) {
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
-	var data map[string]string
-	var maxTimestamp map[string]int64
-	if d.Decode(&data) != nil || d.Decode(&maxTimestamp) != nil {
+	var db map[string]string
+	var lastSeqId map[string]int64
+	var lastApplied int
+	if d.Decode(&db) != nil || d.Decode(&lastSeqId) != nil || d.Decode(&lastApplied) != nil {
 		DPrintf("%v ---- server：%d 反序列化快照失败\n", time.Now(), kv.me)
 	} else {
-		kv.data = data
-		kv.maxTimestamp = maxTimestamp
+		kv.db = db
+		kv.lastSeqId = lastSeqId
+		kv.lastApplied = lastApplied
+	}
+}
+
+func (kv *KVServer) makeSnapshot() {
+	for !kv.killed() {
+		kv.mu.Lock()
+		for kv.persister.RaftStateSize() < (kv.maxraftstate/4) && !kv.killed() {
+			kv.snapshotCond.Wait()
+		}
+		if !kv.killed() {
+			w := new(bytes.Buffer)
+			e := labgob.NewEncoder(w)
+			e.Encode(kv.db)
+			e.Encode(kv.lastSeqId)
+			e.Encode(kv.lastApplied)
+			snapshot := w.Bytes()
+			kv.rf.Snapshot(kv.lastApplied, snapshot)
+		}
+		kv.mu.Unlock()
 	}
 }

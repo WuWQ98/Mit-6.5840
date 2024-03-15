@@ -20,7 +20,6 @@ package raft
 import (
 	"6.5840/labgob"
 	"bytes"
-	"log"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -65,8 +64,8 @@ type Raft struct {
 
 	// 持久化数据
 	currentTerm   int
-	votedFor      VoteForInfo
-	log           []LogInfo
+	votedFor      VoteFor
+	log           []Entry
 	snapshot      []byte // 快照
 	snapshotTerm  int    // 快照包含的最后一条entry的term
 	snapshotIndex int    // 快照包含的最后一条entry的Index
@@ -78,31 +77,16 @@ type Raft struct {
 	nextIndex  []int
 	matchIndex []int
 
-	myRole        role          // 节点角色
+	state         State         // 节点角色
 	lastHeartTime time.Time     // 最近一次心跳时间
 	leaderId      int           // 用于重定向client请求
 	heartTime     time.Duration // 心跳时间
 	applyCh       chan ApplyMsg
+	applyCond     *sync.Cond
+	commitCond    *sync.Cond
+	wg            sync.WaitGroup // 用于调用kill时等待回收资源
 
 	// commitIndex >= lastApplied >= snapshotIndex
-}
-
-type role int32
-
-const (
-	FOLLOWER role = iota
-	CANDIDATE
-	LEADER
-)
-
-type LogInfo struct {
-	Term    int
-	Command interface{}
-}
-
-type VoteForInfo struct {
-	Term        int
-	CandidateId int
 }
 
 // return currentTerm and whether this server
@@ -111,7 +95,7 @@ func (rf *Raft) GetState() (int, bool) {
 	// Your code here (2A).
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	term, isLeader := rf.currentTerm, rf.loadRole() == LEADER
+	term, isLeader := rf.currentTerm, rf.loadState() == LEADER
 	return term, isLeader
 }
 
@@ -153,16 +137,16 @@ func (rf *Raft) readPersist(data []byte) {
 	r := bytes.NewBuffer(data)
 	d := labgob.NewDecoder(r)
 	var currentTerm, snapshotIndex, snapshotTerm int
-	var voteFor VoteForInfo
-	var log []LogInfo
+	var voteFor VoteFor
+	var lg []Entry
 	if d.Decode(&currentTerm) != nil || d.Decode(&voteFor) != nil ||
-		d.Decode(&log) != nil || d.Decode(&snapshotIndex) != nil ||
+		d.Decode(&lg) != nil || d.Decode(&snapshotIndex) != nil ||
 		d.Decode(&snapshotTerm) != nil {
 		DPrintf("%v ---- 节点：%d 读取持久化数据失败\n", time.Now(), rf.me)
 	} else {
 		rf.currentTerm = currentTerm
 		rf.votedFor = voteFor
-		rf.log = log
+		rf.log = lg
 
 		rf.snapshotIndex = snapshotIndex
 		rf.snapshotTerm = snapshotTerm
@@ -189,7 +173,6 @@ func (rf *Raft) Snapshot(index int, snapshot []byte) {
 			rf.snapshotTerm = rf.log[sliceIdx].Term
 			rf.snapshotIndex = index
 			rf.trimLog(sliceIdx)
-			rf.log[0].Term = rf.snapshotTerm // log[0]为占位entry，方便 AE rpc 和 RV rpc 的term比较
 			rf.persist()
 		}
 		rf.mu.Unlock()
@@ -215,13 +198,14 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 
 	index := rf.toLogIndex(len(rf.log))
 	term := rf.currentTerm
-	isLeader := rf.loadRole() == LEADER
+	isLeader := rf.loadState() == LEADER
 
 	if isLeader {
-		DPrintf("%v ---- 节点：%d 接收日志条目 entry = %+v\n", time.Now(), rf.me, LogInfo{Term: rf.currentTerm, Command: command})
-		rf.log = append(rf.log, LogInfo{
+		DPrintf("%v ---- 节点：%d 接收日志条目 entry = %+v\n", time.Now(), rf.me, Entry{Term: rf.currentTerm, Command: command})
+		rf.log = append(rf.log, Entry{
 			Term:    rf.currentTerm,
 			Command: command,
+			Index:   index,
 		})
 		rf.persist()
 		rf.sendAppendEntriesOnce()
@@ -243,6 +227,9 @@ func (rf *Raft) Kill() {
 	// DPrintf("%v ---- 节点：%d 停止时快照为：%v\n", time.Now(), rf.me, rf.snapshot)
 	atomic.StoreInt32(&rf.dead, 1)
 	// Your code here, if desired.
+	rf.commitCond.Broadcast()
+	rf.applyCond.Broadcast()
+	rf.wg.Wait() // 等待applyMsg发送完成
 }
 
 func (rf *Raft) killed() bool {
@@ -260,14 +247,14 @@ func (rf *Raft) ticker() {
 		// Your code here (2A)
 		// Check if a leader election should be started.
 		rf.mu.Lock()
-		if rf.loadRole() != LEADER && time.Since(rf.lastHeartTime).Milliseconds() >= ms {
-			rf.storeRole(CANDIDATE)
+		if rf.loadState() != LEADER && time.Since(rf.lastHeartTime).Milliseconds() >= ms {
+			rf.storeState(CANDIDATE)
 
-			DPrintf("%v ---- 节点：%d 开启选举\n", time.Now(), rf.me)
+			// DPrintf("%v ---- 节点：%d 开启选举\n", time.Now(), rf.me)
 
-			rf.currentTerm++                                 // 增加任期
-			rf.votedFor = VoteForInfo{rf.currentTerm, rf.me} // 给自己投票
-			rf.persist()                                     // 持久化数据
+			rf.currentTerm++                             // 增加任期
+			rf.votedFor = VoteFor{rf.currentTerm, rf.me} // 给自己投票
+			rf.persist()                                 // 持久化数据
 
 			rf.sendRequestVoteOnce()
 		}
@@ -295,9 +282,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	// DPrintf("%v ---- 节点：%d 启动\n", time.Now(), rf.me)
 	rf.applyCh = applyCh
 	rf.heartTime = time.Duration(110) * time.Millisecond
-	rf.log = make([]LogInfo, 1)
+	rf.log = make([]Entry, 1)
 	rf.nextIndex = make([]int, len(rf.peers))
 	rf.matchIndex = make([]int, len(rf.peers))
+	rf.applyCond = sync.NewCond(&rf.mu)
+	rf.commitCond = sync.NewCond(&rf.mu)
+	rf.wg.Add(1)
 
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
@@ -309,60 +299,42 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	go rf.applyLog()
 
-	go rf.printRaftInfo()
+	go rf.printPeerInfo()
 
 	return rf
 }
 
 func (rf *Raft) applyLog() {
-	time.Sleep(time.Duration(1000) * time.Millisecond)
 	for !rf.killed() {
 		rf.mu.Lock()
+		for rf.lastApplied >= rf.commitIndex && !rf.killed() {
+			rf.applyCond.Wait()
+		}
 		begin := rf.toSliceIndex(rf.lastApplied) + 1
 		end := rf.toSliceIndex(rf.commitIndex) + 1
-		if begin < len(rf.log) && begin < end {
-			for i, log := range rf.log[begin:end] {
-				if !rf.killed() {
-					ch := make(chan bool)
-					go func(i int, log LogInfo) {
-						defer func() {
-							if r := recover(); r != nil {
-							}
-						}()
-						rf.applyCh <- ApplyMsg{
-							CommandValid: true,
-							Command:      log.Command,
-							CommandIndex: rf.toLogIndex(begin) + i,
-						}
-						ch <- true
-					}(i, log)
-					select {
-					case <-ch:
-						rf.lastApplied = rf.toLogIndex(begin) + i
-					case <-time.NewTimer(time.Millisecond * time.Duration(1500)).C:
-						if rf.killed() {
-							close(rf.applyCh)
-						}
-					}
-				} else {
-					break
-				}
-			}
-		}
+		entries := make([]Entry, end-begin)
+		copy(entries, rf.log[begin:end])
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(10) * time.Millisecond)
+
+		for _, entry := range entries {
+			rf.applyCh <- ApplyMsg{
+				CommandValid: true,
+				Command:      entry.Command,
+				CommandIndex: entry.Index,
+			}
+			rf.mu.Lock()
+			rf.lastApplied = Max(rf.lastApplied, entry.Index) //安装快照会改变rf.lastApplied
+			rf.mu.Unlock()
+		}
 	}
+	rf.wg.Done()
 }
 
 func (rf *Raft) commit() {
-	time.Sleep(time.Duration(1000) * time.Millisecond)
 	for !rf.killed() {
 		rf.mu.Lock()
+		rf.commitCond.Wait()
 		// 二分查找新的commitIndex
-		if rf.commitIndex < rf.snapshotIndex {
-			time.Sleep(time.Second * time.Duration(60))
-			log.Fatalln("致命错误 commitIndex < snapshotIndex", "commitIndex = ", rf.commitIndex, "snapshotIndex = ", rf.snapshotIndex)
-		}
 		left, right := rf.commitIndex+1, rf.toLogIndex(len(rf.log))-1
 		for right >= left {
 			mid := (right + left) / 2
@@ -378,52 +350,20 @@ func (rf *Raft) commit() {
 				right = mid - 1
 			}
 		}
-		if rf.log[rf.toSliceIndex(right)].Term == rf.currentTerm { //只有当前任期内的entry可以通过计数提交，并将之前的entry一并提交(Figure 8)
+		if rf.log[rf.toSliceIndex(right)].Term == rf.currentTerm && rf.loadState() == LEADER { //只有当前任期内的entry可以通过计数提交，并将之前的entry一并提交(Figure 8)
 			rf.commitIndex = right
-			// DPrintf("%v ---- 节点：%d commitIndex设置为 %d，触发节点为：%d\n", time.Now(), rf.me, rf.commitIndex, triggerIdx)
+			rf.applyCond.Broadcast()
+			// DPrintf("%v ---- 节点：%d commitIndex设置为 %d\n", time.Now(), rf.me, rf.commitIndex)
 		}
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(5) * time.Millisecond)
 	}
 }
 
-func (rf *Raft) loadRole() role {
-	return role(atomic.LoadInt32((*int32)(&rf.myRole)))
-}
-
-func (rf *Raft) storeRole(r role) {
-	atomic.StoreInt32((*int32)(&rf.myRole), int32(r))
-}
-
-// 需要在同步代码块中执行
-func (rf *Raft) updateTerm(term int) {
-	rf.storeRole(FOLLOWER)
-	rf.currentTerm = term
-	rf.persist() // 持久化数据
-}
-
-// 需要在同步代码块中执行
-func (rf *Raft) trimLog(sliceIdx int) {
-	tmp := make([]LogInfo, 1, max(len(rf.log)-sliceIdx, 1))
-	if len(rf.log)-sliceIdx > 1 {
-		tmp = append(tmp, rf.log[sliceIdx+1:]...)
-	}
-	rf.log = tmp
-}
-
-func (rf *Raft) toSliceIndex(logIndex int) int {
-	return logIndex - rf.snapshotIndex
-}
-
-func (rf *Raft) toLogIndex(sliceIndex int) int {
-	return sliceIndex + rf.snapshotIndex
-}
-
-func (rf *Raft) printRaftInfo() {
+func (rf *Raft) printPeerInfo() {
 	for !rf.killed() {
 		rf.mu.Lock()
-		DPrintf("%v ---- 节点: %d, 任期: %d, role: %d, commitIndex: %d, lastApplied: %d, nextIndex: %v, matchIndex: %v, snapshotIndex: %v, snapshotTerm: %v, 日志长度: %d, 日志：%+v\n", time.Now(), rf.me, rf.currentTerm, rf.loadRole(), rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex, rf.snapshotIndex, rf.snapshotTerm, len(rf.log), rf.log)
+		DPrintf("%v ---- 节点: %d, 任期: %d, role: %d, commitIndex: %d, lastApplied: %d, nextIndex: %v, matchIndex: %v, snapshotIndex: %v, snapshotTerm: %v, 日志长度: %d, 日志：%+v\n", time.Now(), rf.me, rf.currentTerm, rf.loadState(), rf.commitIndex, rf.lastApplied, rf.nextIndex, rf.matchIndex, rf.snapshotIndex, rf.snapshotTerm, len(rf.log), rf.log)
 		rf.mu.Unlock()
-		time.Sleep(time.Duration(25) * time.Millisecond)
+		time.Sleep(time.Duration(20) * time.Millisecond)
 	}
 }
