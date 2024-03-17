@@ -32,17 +32,17 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		rf.leaderId = args.LeaderId
 		rf.updateHeartTime()
 		rf.updateTerm(args.Term)
-		// rf.commitIndex 可能大于 args.LastIncludeIndex
-		// 假设leader A向follower B发送心跳rpc0，由于B日志落后过多，日志匹配不成功
-		// rpc0返回后，A给B发送一个快照rpc1
-		// 接着，A向B发送心跳rpc2，rpc2执行时，rpc1已经未执行，日志匹配不成功（由于心跳间隔极短，rpc2比rpc1更快到达，亦或者rpc2比rpc1更先发送）
-		// 接着，A向B发送心跳rpc3，rpc3执行时，rpc1已经执行完毕，此时rpc3会得到日志匹配成功的结果，然后将B的commitIndex设置为A的CommitIndex或B的lastEntry的Index
-		// 接着，rpc2返回后A发送的一个LastIncludeIndex更大的快照rpc4到达B（假设这段时间内A又制作了新的快照，取决kvserver判断是否制作快照的方式）
-		// rpc4中rf.commitIndex 就有可能大于 args.LastIncludeIndex，只要A的CommitIndex或B的lastEntry的Index或大于args.LastIncludeIndex
-		// ps:接收entry时发送心跳导致心跳间隔可以极短
+		// rf.commitIndex 可能大于 args.LastIncludeIndex, 原因如下：
+		// 0. 接收 entry 时发送心跳导致心跳间隔可以变得极短
+		// 1. 假设 leader A 向 follower B 发送心跳 rpc0，由于 B 日志落后过多，日志匹配不成功
+		// 3. （ rpc0 返回后）A 向 B 发送快照 rpc1
+		// 3. （ rpc0 未返回）A 向 B 发送快照 rpc2
+		// 4. （ rpc1 返回后）A 向 B 发送心跳 rpc3
+		// 5. 若 rpc3 比 rpc2 先到达（或者先获取锁），rpc3 日志匹配成功，修改 B 的日志，将 B 的 commitIndex 设置为 min(leaderCommit,lastIndex)
+		// 6. rpc2 执行时就有可能有 LastIncludeIndex < commitIndex 的情况
 
-		// 如果在rf.commitIndex > args.LastIncludeIndex的情况下安装快照，可能有index > args.LastIncludeIndex的entry在applyCh上，
-		// 该entry应用之后就会导致lastApplied = index > snapshotIndex = args.LastIncludeIndex,然后如果kvserver制作快照就会使得snapshotIndex = index > commitIndex = args.LastIncludeIndex
+		// 如果在 rf.commitIndex > args.LastIncludeIndex 的情况下安装快照，可能有 index > args.LastIncludeIndex 的 entry 在 applyCh 上，
+		// 该 entry 应用之后就会导致 lastApplied = index > snapshotIndex = args.LastIncludeIndex, 然后如果 kvserver 制作快照就会使得 snapshotIndex = index > commitIndex = args.LastIncludeIndex
 		if args.LastIncludeIndex > rf.snapshotIndex && args.LastIncludeIndex > rf.commitIndex { //避免过时快照
 			go func(snapshot []byte, lastIncludeTerm, lastIncludeIndex int) {
 				rf.applyCh <- ApplyMsg{
