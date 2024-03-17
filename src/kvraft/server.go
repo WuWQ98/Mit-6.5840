@@ -25,15 +25,18 @@ type KVServer struct {
 
 	maxraftstate int // snapshot if log grows this big
 
-	persister    *raft.Persister
-	db           map[string]string
-	lastSeqId    map[string]int64
-	session      map[string]chan struct{}
-	snapshotCond *sync.Cond
-	lastApplied  int
+	persister   *raft.Persister
+	db          map[string]string
+	lastSeqId   map[string]int64
+	session     map[string]chan struct{}
+	lastApplied int
 }
 
 func (kv *KVServer) Command(args *CommandArgs, reply *CommandReply) {
+	if kv.killed() {
+		return
+	}
+
 	op := Op{*args}
 
 	kv.mu.Lock()
@@ -42,30 +45,25 @@ func (kv *KVServer) Command(args *CommandArgs, reply *CommandReply) {
 
 	if args.SeqId > id {
 		_, _, isLeader := kv.rf.Start(op)
-		kv.snapshotCond.Broadcast()
+		kv.trySnapshot()
 		if isLeader {
 			sessionName := fmt.Sprintf("%s-%d", args.CkId, args.SeqId)
-
 			kv.mu.Lock()
 			kv.session[sessionName] = make(chan struct{})
 			ch := kv.session[sessionName]
 			kv.mu.Unlock()
 
-			timer := time.NewTimer(time.Second)
 			select {
 			case <-ch:
-				timer.Stop()
 				reply.Err = OK
-			case <-timer.C:
+			case <-time.NewTimer(time.Millisecond * time.Duration(500)).C:
 				reply.Err = ErrTimeout
 			}
 
 			kv.mu.Lock()
 			reply.Value = kv.db[args.Key]
-			if _, exist := kv.session[sessionName]; exist {
-				close(kv.session[sessionName])
-				delete(kv.session, sessionName)
-			}
+			close(kv.session[sessionName])
+			delete(kv.session, sessionName)
 			kv.mu.Unlock()
 
 		} else {
@@ -73,7 +71,7 @@ func (kv *KVServer) Command(args *CommandArgs, reply *CommandReply) {
 		}
 	} else { // 带着结果的rpc返回失败后，重试的rpc进入这里
 		if args.SeqId < id {
-			log.Println("警告! [", args.Op, "] 出现意外程序行为", "[args] = ", args, "[lastSeqId] = ", id)
+			log.Println("警告! [", args.Op, "] 出现意外程序行为", "[server] = ", kv.me, "[killed] = ", kv.killed(), kv.rf.Killed(), "[leader] = ", kv.rf.GetLeader(), "[args] = ", args, "[lastSeqId] = ", id, "[db] = ", kv.db)
 		}
 		kv.mu.Lock()
 		reply.Value = kv.db[args.Key]
@@ -83,11 +81,8 @@ func (kv *KVServer) Command(args *CommandArgs, reply *CommandReply) {
 }
 
 func (kv *KVServer) Kill() {
-	kv.rf.Kill() // 先回收raft的资源，再停止从applyCh接收entry
-	kv.mu.Lock()
+	kv.rf.Kill()
 	atomic.StoreInt32(&kv.dead, 1)
-	kv.mu.Unlock()
-	kv.snapshotCond.Broadcast()
 }
 
 func (kv *KVServer) killed() bool {
@@ -105,26 +100,20 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	kv.db = make(map[string]string)
 	kv.lastSeqId = make(map[string]int64)
 	kv.session = make(map[string]chan struct{})
-	kv.snapshotCond = sync.NewCond(&kv.mu)
 
 	kv.persister = persister
-	kv.applyCh = make(chan raft.ApplyMsg)
+	kv.applyCh = make(chan raft.ApplyMsg, 1)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
 	kv.decSnapshot(kv.persister.ReadSnapshot())
 
 	go kv.apply()
 
-	if kv.maxraftstate >= 0 {
-		go kv.makeSnapshot()
-	}
-
 	return kv
 }
 
 func (kv *KVServer) apply() {
-	for !kv.killed() {
-		timer := time.NewTimer(time.Second)
+	for !kv.killed() || len(kv.applyCh) != 0 {
 		select {
 		case msg := <-kv.applyCh:
 			kv.mu.Lock()
@@ -135,11 +124,10 @@ func (kv *KVServer) apply() {
 			} else if msg.CommandValid {
 				kv.doCommand(msg.Command.(Op))
 				kv.lastApplied = msg.CommandIndex
-				kv.snapshotCond.Broadcast()
 			}
 			kv.mu.Unlock()
-			timer.Stop()
-		case <-timer.C:
+			kv.trySnapshot()
+		case <-time.NewTimer(time.Millisecond * time.Duration(500)).C:
 		}
 	}
 }
@@ -174,37 +162,35 @@ func (kv *KVServer) doCommand(cmd Op) {
 }
 
 func (kv *KVServer) decSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
+		return
+	}
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	var db map[string]string
 	var lastSeqId map[string]int64
 	var lastApplied int
 	if d.Decode(&db) != nil || d.Decode(&lastSeqId) != nil || d.Decode(&lastApplied) != nil {
-		DPrintf("%v ---- server：%d 反序列化快照失败\n", time.Now(), kv.me)
+		log.Printf("kvraft, server：%d 反序列化快照失败\n", kv.me)
 	} else {
-		kv.db = db
-		kv.lastSeqId = lastSeqId
-		kv.lastApplied = lastApplied
+		if lastApplied > kv.lastApplied {
+			kv.db = db
+			kv.lastSeqId = lastSeqId
+			kv.lastApplied = lastApplied
+		}
 	}
 }
 
-func (kv *KVServer) makeSnapshot() {
-	for !kv.killed() {
-		kv.mu.Lock()
-		if !kv.killed() {
-			for kv.persister.RaftStateSize() < (kv.maxraftstate/4) && !kv.killed() {
-				kv.snapshotCond.Wait()
-			}
-			if !kv.killed() {
-				w := new(bytes.Buffer)
-				e := labgob.NewEncoder(w)
-				e.Encode(kv.db)
-				e.Encode(kv.lastSeqId)
-				e.Encode(kv.lastApplied)
-				snapshot := w.Bytes()
-				kv.rf.Snapshot(kv.lastApplied, snapshot)
-			}
-		}
-		kv.mu.Unlock()
+func (kv *KVServer) trySnapshot() {
+	kv.mu.Lock()
+	if kv.maxraftstate >= 0 && !kv.killed() && kv.persister.RaftStateSize() >= (kv.maxraftstate/4) {
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+		e.Encode(kv.db)
+		e.Encode(kv.lastSeqId)
+		e.Encode(kv.lastApplied)
+		snapshot := w.Bytes()
+		kv.rf.Snapshot(kv.lastApplied, snapshot)
 	}
+	kv.mu.Unlock()
 }

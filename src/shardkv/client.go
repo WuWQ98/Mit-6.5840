@@ -63,32 +63,50 @@ func MakeClerk(ctrlers []*labrpc.ClientEnd, make_end func(string) *labrpc.Client
 
 func (ck *Clerk) Put(key string, value string) {
 	seqId := time.Now().UnixMilli()
-	args := CommandArgs{key, value, "Put", ck.ckId, seqId}
-	ck.command(args, CommandReply{})
+	args := CommandArgs{
+		Key:   key,
+		Value: value,
+		Op:    "Put",
+		CkId:  ck.ckId,
+		SeqId: seqId,
+	}
+	ck.command(args)
 }
 func (ck *Clerk) Append(key string, value string) {
 	seqId := time.Now().UnixMilli()
-	args := CommandArgs{key, value, "Append", ck.ckId, seqId}
-	ck.command(args, CommandReply{})
+	args := CommandArgs{
+		Key:   key,
+		Value: value,
+		Op:    "Append",
+		CkId:  ck.ckId,
+		SeqId: seqId,
+	}
+	ck.command(args)
 }
 
 func (ck *Clerk) Get(key string) (res string) {
 	seqId := time.Now().UnixMilli()
-	args := CommandArgs{Key: key, Op: "Get", CkId: ck.ckId, SeqId: seqId}
-	return ck.command(args, CommandReply{})
+	args := CommandArgs{
+		Key:   key,
+		Op:    "Get",
+		CkId:  ck.ckId,
+		SeqId: seqId,
+	}
+	return ck.command(args)
 }
 
-func (ck *Clerk) command(args CommandArgs, reply CommandReply) string {
+func (ck *Clerk) command(args CommandArgs) string {
 	defer time.Sleep(time.Duration(1) * time.Millisecond)
+	shard := key2shard(args.Key)
+	args.Shard = shard
 	for {
-		shard := key2shard(args.Key)
 		gid := ck.config.Shards[shard]
 		if servers, ok := ck.config.Groups[gid]; ok {
 			// try each server for the shard.
 			for si := 0; si < len(servers); si++ {
 				srv := ck.make_end(servers[si])
-				var reply GetReply
-				ok := srv.Call("ShardKV.Get", &args, &reply)
+				var reply CommandReply
+				ok := srv.Call("ShardKV.Command", &args, &reply)
 				if ok && (reply.Err == OK || reply.Err == ErrNoKey) {
 					return reply.Value
 				}

@@ -22,12 +22,11 @@ type ShardCtrler struct {
 	dead         int32 // set by Kill()
 	maxraftstate int
 
-	persister    *raft.Persister
-	configs      []Config // indexed by config num
-	lastSeqId    map[string]int64
-	session      map[string]chan struct{}
-	snapshotCond *sync.Cond
-	lastApplied  int
+	persister   *raft.Persister
+	configs     []Config // indexed by config num
+	lastSeqId   map[string]int64
+	session     map[string]chan struct{}
+	lastApplied int
 }
 
 type Op struct {
@@ -49,7 +48,7 @@ func (sc *ShardCtrler) Command(args *CommandArgs, reply *CommandReply) {
 
 	if args.SeqId > id {
 		_, _, isLeader := sc.rf.Start(op)
-		sc.snapshotCond.Broadcast()
+		sc.trySnapshot()
 		if isLeader {
 			sessionName := fmt.Sprintf("%s-%d", args.CkId, args.SeqId)
 
@@ -58,21 +57,17 @@ func (sc *ShardCtrler) Command(args *CommandArgs, reply *CommandReply) {
 			ch := sc.session[sessionName]
 			sc.mu.Unlock()
 
-			timer := time.NewTimer(time.Second)
 			select {
 			case <-ch:
-				timer.Stop()
 				reply.Err = OK
-			case <-timer.C:
+			case <-time.NewTimer(time.Millisecond * time.Duration(500)).C:
 				reply.Err = ErrTimeout
 			}
 
 			sc.mu.Lock()
 			reply.Config = sc.QueryCfg(args.Num)
-			if _, exist := sc.session[sessionName]; exist {
-				close(sc.session[sessionName])
-				delete(sc.session, sessionName)
-			}
+			close(sc.session[sessionName])
+			delete(sc.session, sessionName)
 			sc.mu.Unlock()
 
 		} else {
@@ -80,7 +75,7 @@ func (sc *ShardCtrler) Command(args *CommandArgs, reply *CommandReply) {
 		}
 	} else { // 带着结果的rpc返回失败后，重试的rpc进入这里
 		if args.SeqId < id {
-			log.Println("警告! [", args.OpType, "] 出现意外程序行为", "[args] = ", args, "[lastSeqId] = ", id)
+			log.Println("警告! [", args.OpType, "] 出现意外程序行为", "[server] = ", sc.me, "[killed] = ", sc.killed(), sc.rf.Killed(), "[leader] = ", sc.rf.GetLeader(), "[args] = ", args, "[lastSeqId] = ", id, "[configs] = ", sc.configs)
 		}
 		sc.mu.Lock()
 		reply.Config = sc.QueryCfg(args.Num)
@@ -91,10 +86,7 @@ func (sc *ShardCtrler) Command(args *CommandArgs, reply *CommandReply) {
 
 func (sc *ShardCtrler) Kill() {
 	sc.rf.Kill()
-	sc.mu.Lock()
 	atomic.StoreInt32(&sc.dead, 1)
-	sc.mu.Unlock()
-	sc.snapshotCond.Broadcast()
 }
 
 func (sc *ShardCtrler) killed() bool {
@@ -114,27 +106,23 @@ func StartServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persister)
 	sc.configs[0].Groups = map[int][]string{}
 
 	labgob.Register(Op{})
-	sc.applyCh = make(chan raft.ApplyMsg)
+	sc.applyCh = make(chan raft.ApplyMsg, 1)
 	sc.rf = raft.Make(servers, me, persister, sc.applyCh)
 
 	sc.persister = persister
 	sc.session = make(map[string]chan struct{})
 	sc.lastSeqId = make(map[string]int64)
 	sc.maxraftstate = 1000
-	sc.snapshotCond = sync.NewCond(&sc.mu)
 
 	sc.decSnapshot(sc.persister.ReadSnapshot())
 
 	go sc.apply()
 
-	go sc.makeSnapshot()
-
 	return sc
 }
 
 func (sc *ShardCtrler) apply() {
-	for !sc.killed() {
-		timer := time.NewTimer(time.Second)
+	for !sc.killed() || len(sc.applyCh) != 0 {
 		select {
 		case msg := <-sc.applyCh:
 			sc.mu.Lock()
@@ -145,11 +133,10 @@ func (sc *ShardCtrler) apply() {
 			} else if msg.CommandValid {
 				sc.doCommand(msg.Command.(Op))
 				sc.lastApplied = msg.CommandIndex
-				sc.snapshotCond.Broadcast()
 			}
 			sc.mu.Unlock()
-			timer.Stop()
-		case <-timer.C:
+			sc.trySnapshot()
+		case <-time.NewTimer(time.Second).C:
 		}
 	}
 }
@@ -251,37 +238,35 @@ func (sc *ShardCtrler) doQueryCommand(cmd Op) {
 }
 
 func (sc *ShardCtrler) decSnapshot(snapshot []byte) {
+	if snapshot == nil || len(snapshot) < 1 { // bootstrap without any state?
+		return
+	}
 	r := bytes.NewBuffer(snapshot)
 	d := labgob.NewDecoder(r)
 	var configs []Config
 	var lastSeqId map[string]int64
 	var lastApplied int
 	if d.Decode(&configs) != nil || d.Decode(&lastSeqId) != nil || d.Decode(&lastApplied) != nil {
-		DPrintf("%v ---- server：%d 反序列化快照失败\n", time.Now(), sc.me)
+		log.Printf("shardctrler, server：%d 反序列化快照失败\n", sc.me)
 	} else {
-		sc.configs = configs
-		sc.lastSeqId = lastSeqId
-		sc.lastApplied = lastApplied
+		if lastApplied > sc.lastApplied {
+			sc.configs = configs
+			sc.lastSeqId = lastSeqId
+			sc.lastApplied = lastApplied
+		}
 	}
 }
 
-func (sc *ShardCtrler) makeSnapshot() {
-	for !sc.killed() {
-		sc.mu.Lock()
-		if !sc.killed() {
-			for sc.persister.RaftStateSize() < (sc.maxraftstate/4) && !sc.killed() {
-				sc.snapshotCond.Wait()
-			}
-			if !sc.killed() {
-				w := new(bytes.Buffer)
-				e := labgob.NewEncoder(w)
-				e.Encode(sc.configs)
-				e.Encode(sc.lastSeqId)
-				e.Encode(sc.lastApplied)
-				snapshot := w.Bytes()
-				sc.rf.Snapshot(sc.lastApplied, snapshot)
-			}
-		}
-		sc.mu.Unlock()
+func (sc *ShardCtrler) trySnapshot() {
+	sc.mu.Lock()
+	if sc.maxraftstate >= 0 && !sc.killed() && sc.persister.RaftStateSize() >= (sc.maxraftstate/4) {
+		w := new(bytes.Buffer)
+		e := labgob.NewEncoder(w)
+		e.Encode(sc.configs)
+		e.Encode(sc.lastSeqId)
+		e.Encode(sc.lastApplied)
+		snapshot := w.Bytes()
+		sc.rf.Snapshot(sc.lastApplied, snapshot)
 	}
+	sc.mu.Unlock()
 }

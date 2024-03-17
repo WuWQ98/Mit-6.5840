@@ -26,7 +26,7 @@ func DPrintf(format string, a ...interface{}) (n int, err error) {
 	defer lock.Unlock()
 	file, _ := os.OpenFile(filename, os.O_WRONLY|os.O_APPEND|os.O_CREATE, 0777)
 	defer file.Close()
-	fmt.Fprintf(file, format, a...)
+	fmt.Fprintf(file, time.Now().Format("2006-01-02 15:04:05")+" ---- "+format+"\n", a...)
 	return
 }
 

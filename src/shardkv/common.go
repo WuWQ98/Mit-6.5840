@@ -49,6 +49,7 @@ type CommandArgs struct {
 	Op    string
 	CkId  string
 	SeqId int64
+	Shard int
 }
 
 type CommandReply struct {

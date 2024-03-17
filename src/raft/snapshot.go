@@ -1,40 +1,36 @@
 package raft
 
-import (
-	"time"
-)
-
 func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
 	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
 	return ok
 }
 
-func (rf *Raft) sendSnapshotOnce(idx int) {
-	isArgs := &InstallSnapshotArgs{rf.currentTerm, rf.me, rf.snapshotIndex, rf.snapshotTerm, rf.snapshot}
-	isReply := &InstallSnapshotReply{}
-	go func() {
-		DPrintf("%v ---- 节点：%d 给 %d 发送快照\n", time.Now(), rf.me, idx)
-		ok := rf.sendInstallSnapshot(idx, isArgs, isReply)
-		if !ok {
-			return
-		}
-		rf.mu.Lock()
-		defer rf.mu.Unlock()
-		if isReply.Term > rf.currentTerm {
-			rf.updateTerm(isReply.Term)
-		}
-	}()
+func (rf *Raft) sendSnapshotOne(idx int, args InstallSnapshotArgs) {
+	reply := InstallSnapshotReply{}
+	ok := rf.sendInstallSnapshot(idx, &args, &reply)
+	if !ok {
+		return
+	}
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
+	if reply.Term > rf.currentTerm {
+		rf.updateTerm(args.Term)
+	} else {
+		rf.matchIndex[idx] = Max(rf.matchIndex[idx], args.LastIncludeIndex)
+		rf.nextIndex[idx] = args.LastIncludeIndex + 1
+	}
 }
 
 func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	if rf.killed() {
+		return
+	}
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
-	rf.wg.Add(1)
-	defer rf.wg.Done()
-	DPrintf("%v ---- 节点：%d 接收 %d 的快照\n", time.Now(), rf.me, args.LeaderId)
+	DPrintf("节点 [%d] 接收节点 [%d] 快照, args = [%+v]", rf.me, args.LeaderId, args)
 	if args.Term >= rf.currentTerm {
 		rf.leaderId = args.LeaderId
-		rf.updateTime()
+		rf.updateHeartTime()
 		rf.updateTerm(args.Term)
 		// rf.commitIndex 可能大于 args.LastIncludeIndex
 		// 假设leader A向follower B发送心跳rpc0，由于B日志落后过多，日志匹配不成功
@@ -48,21 +44,24 @@ func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapsho
 		// 如果在rf.commitIndex > args.LastIncludeIndex的情况下安装快照，可能有index > args.LastIncludeIndex的entry在applyCh上，
 		// 该entry应用之后就会导致lastApplied = index > snapshotIndex = args.LastIncludeIndex,然后如果kvserver制作快照就会使得snapshotIndex = index > commitIndex = args.LastIncludeIndex
 		if args.LastIncludeIndex > rf.snapshotIndex && args.LastIncludeIndex > rf.commitIndex { //避免过时快照
-			rf.applyCh <- ApplyMsg{
-				SnapshotValid: true,
-				Snapshot:      args.Snapshot,
-				SnapshotTerm:  args.LastIncludeTerm,
-				SnapshotIndex: args.LastIncludeIndex,
-			}
+			go func(snapshot []byte, lastIncludeTerm, lastIncludeIndex int) {
+				rf.applyCh <- ApplyMsg{
+					SnapshotValid: true,
+					Snapshot:      snapshot,
+					SnapshotTerm:  lastIncludeTerm,
+					SnapshotIndex: lastIncludeIndex,
+				}
+			}(args.Snapshot, args.LastIncludeTerm, args.LastIncludeIndex)
+
+			i := rf.toSliceIndex(args.LastIncludeIndex)
+
 			rf.snapshot = args.Snapshot
 			rf.snapshotIndex = args.LastIncludeIndex
 			rf.snapshotTerm = args.LastIncludeTerm
-
-			rf.log = make([]Entry, 1)
-
-			rf.log[0].Term = args.LastIncludeTerm
-			rf.commitIndex = args.LastIncludeIndex
 			rf.lastApplied = args.LastIncludeIndex
+			rf.commitIndex = args.LastIncludeIndex
+
+			rf.trimEntry(i)
 			rf.persist()
 		}
 	}
